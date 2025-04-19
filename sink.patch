@@ -1,0 +1,200 @@
+diff --git a/xbmc/cores/AudioEngine/Sinks/AESinkALSA.cpp b/xbmc/cores/AudioEngine/Sinks/AESinkALSA.cpp
+index 990583e36d..acaae01a84 100644
+--- a/xbmc/cores/AudioEngine/Sinks/AESinkALSA.cpp
++++ b/xbmc/cores/AudioEngine/Sinks/AESinkALSA.cpp
+@@ -11,6 +11,7 @@
+ #include "ServiceBroker.h"
+ #include "cores/AudioEngine/AESinkFactory.h"
+ #include "cores/AudioEngine/Sinks/alsa/ALSADeviceMonitor.h"
++#include <alsa/mixer.h>
+ #ifndef HAVE_X11
+ #include "cores/AudioEngine/Sinks/alsa/ALSAHControlMonitor.h"
+ #endif
+@@ -87,7 +88,10 @@ inline std::unique_ptr<snd_config_t, SndConfigDeleter> SndConfigCopy(snd_config_
+ } // namespace
+ 
+ CAESinkALSA::CAESinkALSA() :
+-  m_pcm(NULL)
++  m_pcm(NULL),
++  m_mixer(NULL),
++  m_sid(NULL),
++  m_mixer_elem(NULL)
+ {
+   /* ensure that ALSA has been initialized */
+   if (!snd_config)
+@@ -551,6 +555,16 @@ bool CAESinkALSA::Initialize(AEAudioFormat &format, std::string &device)
+ 
+   CLog::Log(LOGINFO, "CAESinkALSA::Initialize - Opened device \"{}\"", device);
+ 
++  if (!OpenMixer("hw:1", "PCM"))
++  {
++    CLog::Log(LOGERROR, "CAESinkALSA::Initialize - failed to initialize  \"hw:1\" mixer \"PCM\"");
++    DeinitializeMixer();
++    //snd_pcm_close(m_pcm);    
++    //return false;
++  } else {
++    CLog::Log(LOGINFO, "CAESinkALSA::Initialize - Opened \"hw:1\" mixer \"PCM\"");  
++  }
++
+   snd_pcm_chmap_t* selectedChmap = NULL;
+   if (!m_passthrough)
+   {
+@@ -867,6 +881,23 @@ void CAESinkALSA::Deinitialize()
+     snd_pcm_close(m_pcm);
+     m_pcm = NULL;
+   }
++  DeinitializeMixer();
++}
++
++void CAESinkALSA::DeinitializeMixer()
++{
++  CLog::Log(LOGINFO, "CAESinkALSA::DeinitializeMixer");
++  if (m_mixer) 
++  {
++    snd_mixer_close(m_mixer);
++    m_mixer = NULL;
++  }
++  if (m_sid) 
++  {
++    snd_mixer_selem_id_free(m_sid);
++    m_sid = NULL;    
++  }
++  m_mixer_elem = NULL;
+ }
+ 
+ void CAESinkALSA::Stop()
+@@ -992,6 +1023,21 @@ void CAESinkALSA::Drain()
+   snd_pcm_prepare(m_pcm);
+ }
+ 
++bool  CAESinkALSA::HasVolume() {
++   return m_mixer_elem != NULL;
++}
++
++void  CAESinkALSA::SetVolume(float volume) {
++   if (m_mixer_elem != NULL) {
++      long int_volume = m_vol_min + (long)((m_vol_max - m_vol_min ) * volume);
++      int err;
++      if ((err = snd_mixer_selem_set_playback_volume_all(m_mixer_elem, int_volume)) < 0) {
++         CLog::Log(LOGERROR, "snd_mixer_selem_set_playback_volume_all {} ({})  volume {}  int_volume {}",
++                   err, snd_strerror(err), volume, int_volume);
++      }      
++   } 
++}
++
+ void CAESinkALSA::AppendParams(std::string &device, const std::string &params)
+ {
+   /* Note: escaping, e.g. "plug:'something:X=y'" isn't handled,
+@@ -1039,6 +1085,70 @@ bool CAESinkALSA::TryDeviceWithParams(const std::string &name, const std::string
+   return TryDevice(name, pcmp, lconf);
+ }
+ 
++bool CAESinkALSA::OpenMixer(const std::string &name, const std::string &selem_name) {
++    int err;
++    if ((err = snd_mixer_open(&m_mixer, 0)) < 0) {
++      CLog::Log(LOGERROR, "snd_mixer_open returned {} ({})",
++                err, snd_strerror(err));
++      return false;
++    }
++    if ((err = snd_mixer_attach(m_mixer, name.c_str())) < 0) {
++      CLog::Log(LOGERROR, "snd_mixer_attach {} ({})  Card: \"{}\"",
++                err, snd_strerror(err), name);
++      snd_mixer_close(m_mixer);
++      m_mixer = NULL;
++      return false;
++    }
++    if ((err = snd_mixer_selem_register(m_mixer, nullptr, nullptr)) < 0) {
++      CLog::Log(LOGERROR, "snd_mixer_selem_register {} ({})",
++                err, snd_strerror(err));
++      snd_mixer_close(m_mixer);
++      m_mixer = NULL;      
++      return false;
++    }
++    if ((err = snd_mixer_load(m_mixer)) < 0) {
++      CLog::Log(LOGERROR, "snd_mixer_load {} ({})",
++                err, snd_strerror(err));
++      snd_mixer_close(m_mixer);
++      m_mixer = NULL;      
++      return false;
++    }
++    
++    if ((err = snd_mixer_selem_id_malloc(&m_sid)) < 0) {
++      CLog::Log(LOGERROR, "snd_mixer_selem_id_malloc {} ({})",
++                err, snd_strerror(err));
++      snd_mixer_close(m_mixer);
++      m_mixer = NULL;      
++      return false;
++    }
++    
++    snd_mixer_selem_id_set_index(m_sid, 0);
++    snd_mixer_selem_id_set_name(m_sid, selem_name.c_str());
++    
++    m_mixer_elem = snd_mixer_find_selem(m_mixer, m_sid);
++    if (m_mixer_elem == NULL) {
++        CLog::Log(LOGERROR, "snd_mixer_find_selem unable to find Mixer: \"{}\"",
++                  selem_name);
++
++        return false;
++    }
++    
++    if ((err = snd_mixer_selem_get_playback_volume_range(m_mixer_elem, &m_vol_min, &m_vol_max)) < 0) {
++      CLog::Log(LOGERROR, "snd_mixer_selem_get_playback_volume_range {} ({})",
++                err, snd_strerror(err));
++      snd_mixer_selem_id_free(m_sid);
++      m_sid = NULL;
++      snd_mixer_close(m_mixer);
++      m_mixer = NULL;      
++      return false;
++    }
++    
++    CLog::Log(LOGINFO, "Mixer \"{}\"  Card \"{}\"  Min_volume {}  Max_volume {}",
++                selem_name, name, m_vol_min, m_vol_max);
++    
++    return true;
++}
++
+ bool CAESinkALSA::OpenPCMDevice(const std::string &name, const std::string &params, int channels, snd_pcm_t **pcmp, snd_config_t *lconf)
+ {
+  /* Special name denoting surroundXX mangling. This is needed for some
+diff --git a/xbmc/cores/AudioEngine/Sinks/AESinkALSA.h b/xbmc/cores/AudioEngine/Sinks/AESinkALSA.h
+index 90c532176d..72328271c4 100644
+--- a/xbmc/cores/AudioEngine/Sinks/AESinkALSA.h
++++ b/xbmc/cores/AudioEngine/Sinks/AESinkALSA.h
+@@ -33,12 +33,16 @@ public:
+ 
+   bool Initialize(AEAudioFormat &format, std::string &device) override;
+   void Deinitialize() override;
++  void DeinitializeMixer();
+ 
+   virtual void Stop ();
+   void GetDelay(AEDelayStatus& status) override;
+   double GetCacheTotal() override;
+   unsigned int AddPackets(uint8_t **data, unsigned int frames, unsigned int offset) override;
+   void Drain() override;
++  
++  bool  HasVolume() override;
++  void  SetVolume(float volume) override;
+ 
+ private:
+   CAEChannelInfo GetChannelLayoutRaw(const AEAudioFormat& format);
+@@ -65,6 +69,12 @@ private:
+   bool m_passthrough = false;
+   std::string m_device;
+   snd_pcm_t *m_pcm;
++  snd_mixer_t *m_mixer;
++  snd_mixer_selem_id_t * m_sid;
++  snd_mixer_elem_t* m_mixer_elem;
++  long m_vol_min;
++  long m_vol_max;
++
+   int m_timeout = 0;
+   // support fragmentation, e.g. looping in the sink to get a certain amount of data onto the device
+   bool m_fragmented = false;
+@@ -88,6 +98,7 @@ private:
+   static bool TryDevice(const std::string &name, snd_pcm_t **pcmp, snd_config_t *lconf);
+   static bool TryDeviceWithParams(const std::string &name, const std::string &params, snd_pcm_t **pcmp, snd_config_t *lconf);
+   static bool OpenPCMDevice(const std::string &name, const std::string &params, int channels, snd_pcm_t **pcmp, snd_config_t *lconf);
++  bool OpenMixer(const std::string &name, const std::string &selem_name);
+ 
+   static AEDeviceType AEDeviceTypeFromName(const std::string &name);
+   static std::string GetParamFromName(const std::string &name, const std::string &param);
